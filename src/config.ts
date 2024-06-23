@@ -27,6 +27,7 @@ export async function loadConfig(overrides?: OverrideConfig): Promise<Context> {
   const result = await c12<Config>({
     name: "zotero-plugin",
     dotenv: true,
+    packageJson: true,
     defaults: getDefaultConfig(),
     overrides: overrides as Config,
   });
@@ -39,7 +40,7 @@ function resolveConfig(config: Config): Context {
       encoding: "utf-8",
     }),
     [, owner, repo] = (pkg.repository?.url ?? "").match(
-      /:\/\/github.com\/([^/]+)\/([^.]+)\.git$/,
+      /:\/\/.*.com\/([^/]+)\/([^.]+)\.git$/,
     ),
     data = {
       owner: owner,
@@ -75,19 +76,19 @@ function resolveConfig(config: Config): Context {
 const getDefaultConfig = () => <Config>defaultConfig;
 
 const defaultConfig = {
-  source: ["src"],
+  source: "src",
   dist: "build",
 
   name: "",
   id: "",
   namespace: "",
   xpiDownloadLink:
-    "https://github.com/{{owner}}/{{repo}}/release/download/v{{version}}/{{xpiName}}.xpi",
+    "https://github.com/{{owner}}/{{repo}}/releases/download/v{{version}}/{{xpiName}}.xpi",
   updateURL:
-    "https://github.com/{{owner}}/{{repo}}/release/download/release/update.json",
+    "https://github.com/{{owner}}/{{repo}}/releases/download/release/update.json",
 
   build: {
-    assets: ["src/**/*.*", "!src/**/*.ts"],
+    assets: "addon/**/*.*",
     define: {},
     fluent: {
       prefixFluentMessages: true,
@@ -130,7 +131,12 @@ const defaultConfig = {
     hooks: {},
   },
   server: {
-    startArgs: ["--debugger", "--purgecaches"],
+    startArgs: [
+      "--start-debugger-server",
+      "--jsdebugger",
+      "--debugger",
+      "--purgecaches",
+    ],
     asProxy: false,
     hooks: {},
   },

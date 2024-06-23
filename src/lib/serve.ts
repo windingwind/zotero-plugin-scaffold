@@ -39,10 +39,10 @@ export default class Serve extends Base {
 
     // start Zotero
     if (this.ctx.server.asProxy) {
-      this.startZotero();
+      this.startZoteroByProxyFile();
     } else {
       console.log("");
-      await this.startZoteroWebExt();
+      await this.startZoteroByWebExt();
     }
 
     // watch
@@ -62,10 +62,16 @@ export default class Serve extends Base {
       try {
         await this.ctx.hooks.callHook("serve:onChanged", this.ctx, path);
 
-        if (path.endsWith(".ts")) {
-          this.builder.esbuild();
+        if (path.endsWith(".ts") || path.endsWith(".tsx")) {
+          await this.builder.esbuild();
         } else {
-          this.builder.run();
+          await this.builder.run();
+        }
+
+        if (this.ctx.server.asProxy) {
+          this.reload();
+          this.logger.info("Reloaded done.");
+          await this.ctx.hooks.callHook("serve:onReloaded", this.ctx);
         }
       } catch (err) {
         // Do not abort the watcher when errors occur
@@ -82,20 +88,14 @@ export default class Serve extends Base {
       })
       .on("change", async (path) => {
         if (this.ctx.server.asProxy) {
-          this.logger.log(`\n${path} changed`);
+          console.clear();
+          this.logger.log(`${path} changed`);
         } else {
           // 从 web-ext 的 reload 日志上换行
           console.log("");
         }
 
-        onChange.cancel();
         onChange(path);
-
-        if (this.ctx.server.asProxy) {
-          this.reload();
-          this.logger.info("Reloaded done.");
-          await this.ctx.hooks.callHook("serve:onReloaded", this.ctx);
-        }
       })
       .on("error", (err) => {
         this.logger.error("Server start failed!", err);
@@ -105,37 +105,22 @@ export default class Serve extends Base {
   /**
    * Starts zotero with plugins pre-installed as proxy file
    */
-  async startZotero() {
-    let isZoteroReady = false;
-    if (!fs.existsSync(this.zoteroBinPath)) {
-      throw new Error("Zotero binary does not exist.");
-    }
-
-    if (!fs.existsSync(this.profilePath)) {
-      throw new Error("The given Zotero profile does not exist.");
-    }
-
+  async startZoteroByProxyFile() {
     this.prepareDevEnv();
 
     const zoteroProcess = spawn(this.zoteroBinPath, [
+      // Do not disable remote, or the debug bridge command will not run.
+      // "--no-remote",
+      "--start-debugger-server",
+      "--jsdebugger",
       "--debugger",
       "--purgecaches",
       "-profile",
       this.profilePath,
     ]);
 
-    zoteroProcess.stdout?.on("data", (data) => {
-      if (
-        !isZoteroReady &&
-        data.toString().includes(`Plugin ${this.id} startup`)
-      ) {
-        this.logger.log(data.toString());
-        isZoteroReady = true;
-        setTimeout(() => {
-          this.openDevTool();
-        }, 1000);
-      }
-    });
+    // Necessary on MacOS
+    zoteroProcess.stdout?.on("data", (data) => {});
 
     zoteroProcess.on("close", (code) => {
       this.logger.info(`Zotero terminated with code ${code}.`);
@@ -154,7 +139,7 @@ export default class Serve extends Base {
   /**
    * start zotero with plugin installed and reload when dist changed
    */
-  async startZoteroWebExt() {
+  async startZoteroByWebExt() {
     return await webext.cmd.run(
       {
         firefox: this.zoteroBinPath,
@@ -163,8 +148,9 @@ export default class Serve extends Base {
         keepProfileChanges: true,
         args: this.ctx.server.startArgs,
         pref: { "extensions.experiments.enabled": true },
-        browserConsole: true,
-        // devtools: true, // need Zotero upgrade to firefox 115,
+        // Use Zotero's devtools instead
+        browserConsole: false,
+        devtools: false,
         noInput: true,
       },
       {
@@ -175,12 +161,16 @@ export default class Serve extends Base {
       },
     );
   }
+
   /**
    * Preparing the development environment
    *
-   * When asProxy=true, generate a proxy file to replace prefs.
+   * When asProxy=true, generate a proxy file and replace prefs.
+   *
+   * @see https://www.zotero.org/support/dev/client_coding/plugin_development#setting_up_a_plugin_development_environment
    */
   prepareDevEnv() {
+    // Create a proxy file
     const addonProxyFilePath = path.join(
       this.profilePath,
       `extensions/${this.id}`,
@@ -198,14 +188,17 @@ export default class Serve extends Base {
       );
     }
 
+    // Delete XPI file
     const addonXpiFilePath = path.join(
       this.profilePath,
       `extensions/${this.id}.xpi`,
     );
     if (fs.existsSync(addonXpiFilePath)) {
-      fs.rmSync(addonXpiFilePath);
+      fs.removeSync(addonXpiFilePath);
+      this.logger.debug(`XPI file found, removed.`);
     }
 
+    // Force Zotero to load the plugin from the proxy file
     const prefsPath = path.join(this.profilePath, "prefs.js");
     if (fs.existsSync(prefsPath)) {
       const PrefsLines = fs.readFileSync(prefsPath, "utf-8").split("\n");
@@ -224,6 +217,21 @@ export default class Serve extends Base {
       const updatedPrefs = filteredLines.join("\n");
       fs.writeFileSync(prefsPath, updatedPrefs, "utf-8");
       this.logger.debug("The <profile>/prefs.js has been modified.");
+    }
+
+    // Force enable plugin in extensions.json
+    const addonInfoFilePath = path.join(this.profilePath, "extensions.json");
+    if (fs.existsSync(addonInfoFilePath)) {
+      const content = fs.readJSONSync(addonInfoFilePath);
+      content.addons = content.addons.map((addon: any) => {
+        if (addon.id === this.id && addon.active === false) {
+          addon.active = true;
+          addon.userDisabled = false;
+          this.logger.debug(`Active plugin ${this.id} in extensions.json.`);
+        }
+        return addon;
+      });
+      fs.outputJSONSync(addonInfoFilePath, content);
     }
   }
 
@@ -247,69 +255,6 @@ export default class Serve extends Base {
     })()`;
     const url = `zotero://ztoolkit-debug/?run=${encodeURIComponent(
       reloadScript,
-    )}`;
-    const startZoteroCmd = `"${this.zoteroBinPath}" --debugger --purgecaches -profile "${this.profilePath}"`;
-    const command = `${startZoteroCmd} -url "${url}"`;
-    execSync(command);
-  }
-
-  openDevTool() {
-    this.logger.debug("Open dev tools...");
-    const openDevToolScript = `
-    (async () => {
-    
-    // const { BrowserToolboxLauncher } = ChromeUtils.import(
-    //   "resource://devtools/client/framework/browser-toolbox/Launcher.jsm",
-    // );
-    // BrowserToolboxLauncher.init();
-    // TODO: Use the above code to open the devtool after https://github.com/zotero/zotero/pull/3387
-    
-    Zotero.Prefs.set("devtools.debugger.remote-enabled", true, true);
-    Zotero.Prefs.set("devtools.debugger.remote-port", 6100, true);
-    Zotero.Prefs.set("devtools.debugger.prompt-connection", false, true);
-    Zotero.Prefs.set("devtools.debugger.chrome-debugging-websocket", false, true);
-    
-    env =
-        Services.env ||
-        Cc["@mozilla.org/process/environment;1"].getService(Ci.nsIEnvironment);
-    
-    env.set("MOZ_BROWSER_TOOLBOX_PORT", 6100);
-    Zotero.openInViewer(
-        "chrome://devtools/content/framework/browser-toolbox/window.html",
-        {
-        onLoad: (doc) => {
-            doc.querySelector("#status-message-container").style.visibility =
-            "collapse";
-            let toolboxBody;
-            waitUntil(
-            () => {
-                toolboxBody = doc
-                .querySelector(".devtools-toolbox-browsertoolbox-iframe")
-                ?.contentDocument?.querySelector(".theme-body");
-                return toolboxBody;
-            },
-            () => {
-                toolboxBody.style = "pointer-events: all !important";
-            }
-            );
-        },
-        }
-    );
-    
-    function waitUntil(condition, callback, interval = 100, timeout = 10000) {
-        const start = Date.now();
-        const intervalId = setInterval(() => {
-        if (condition()) {
-            clearInterval(intervalId);
-            callback();
-        } else if (Date.now() - start > timeout) {
-            clearInterval(intervalId);
-        }
-        }, interval);
-    }  
-    })()`;
-    const url = `zotero://ztoolkit-debug/?run=${encodeURIComponent(
-      openDevToolScript,
     )}`;
     const startZoteroCmd = `"${this.zoteroBinPath}" --debugger --purgecaches -profile "${this.profilePath}"`;
     const command = `${startZoteroCmd} -url "${url}"`;

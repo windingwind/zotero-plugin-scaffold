@@ -6,7 +6,7 @@ import { default as glob } from "fast-glob";
 import fs from "fs-extra";
 import mime from "mime";
 import { Octokit } from "octokit";
-import path from "path";
+import { basename, join } from "path";
 import _ from "radash";
 import { isCI } from "std-env";
 
@@ -17,6 +17,11 @@ export default class Release extends Base {
     super(ctx);
     this.isCI = isCI;
     this.client = this.getClient();
+
+    // Output detailed logs in CI for debugging purposes
+    if (this.isCI) {
+      this.logger.level = 4;
+    }
   }
 
   /**
@@ -35,8 +40,10 @@ export default class Release extends Base {
       if (glob.globSync(`${this.dist}/*.xpi`).length == 0) {
         throw new Error("No xpi file found, are you sure you have run build?");
       }
+      this.logger.info("Uploading XPI...");
       await this.uploadXPI();
-      await this.uploadUpdateJSON();
+      this.logger.info("Uploading update manifest...");
+      await this.refreshUpdateManifest();
     }
 
     this.logger.success(
@@ -50,7 +57,9 @@ export default class Release extends Base {
    * release: bump version, run build, git add, git commit, git tag, git push
    */
   async bump() {
-    await versionBump(this.ctx.release.bumpp);
+    const result = await versionBump(this.ctx.release.bumpp);
+    this.ctx.version = result.newVersion;
+    this.ctx.release.bumpp.tag = result.tag;
     // const releaseItConfig: ReleaseItConfig = {
     //   "only-version": true,
     // };
@@ -76,7 +85,9 @@ export default class Release extends Base {
     const release = await this.createRelease({
       owner: this.owner,
       repo: this.repo,
-      tag_name: `v${this.version}`,
+      tag_name: this.ctx.release.bumpp
+        .tag!.toString()
+        .replaceAll("%s", this.version),
       name: `Release v${this.version}`,
       body: await this.getChangelog(),
       prerelease: this.version.includes("-"),
@@ -85,7 +96,9 @@ export default class Release extends Base {
 
     if (!release) throw new Error("Create release failed!");
 
-    this.uploadAsset(release.id, path.join(this.dist, `${this.xpiName}.xpi`));
+    this.logger.debug("Uploading xpi asset...");
+
+    await this.uploadAsset(release.id, join(this.dist, `${this.xpiName}.xpi`));
   }
 
   async getReleaseByTag(tag: string) {
@@ -95,8 +108,12 @@ export default class Release extends Base {
         repo: this.repo,
         tag: tag,
       })
+      .catch((e) => {
+        this.logger.log(`Release with tag ${tag} not found.`);
+        return undefined;
+      })
       .then((res) => {
-        if (res.status == 200) {
+        if (res && res.status == 200) {
           return res.data;
         }
       });
@@ -105,11 +122,18 @@ export default class Release extends Base {
   async createRelease(
     options: Parameters<Octokit["rest"]["repos"]["createRelease"]>[0],
   ) {
-    return await this.client.rest.repos.createRelease(options).then((res) => {
-      if (res.status == 201) {
-        return res.data;
-      }
-    });
+    this.logger.debug("Creating release...", options);
+    return await this.client.rest.repos
+      .createRelease(options)
+      .catch((e) => {
+        this.logger.error(e);
+        throw new Error("Create release failed.");
+      })
+      .then((res) => {
+        if (res.status == 201) {
+          return res.data;
+        }
+      });
   }
 
   async uploadAsset(releaseID: number, asset: string) {
@@ -123,15 +147,15 @@ export default class Release extends Base {
           "content-type": mime.getType(asset) || "application/octet-stream",
           "content-length": fs.statSync(asset).size,
         },
-        name: path.basename(asset),
+        name: basename(asset),
       })
       .then((res) => {
         return res.data;
       });
   }
 
-  async uploadUpdateJSON() {
-    const assets = ["update.json", "update-beta.json"];
+  async refreshUpdateManifest() {
+    const assets = glob.globSync(`${this.dist}/*.json`).map((p) => basename(p));
 
     const release =
       (await this.getReleaseByTag("release")) ??
@@ -139,18 +163,11 @@ export default class Release extends Base {
         owner: this.owner,
         repo: this.repo,
         tag_name: "release",
+        prerelease: true,
+        make_latest: "false",
       }));
 
     if (!release) throw new Error("Get or create 'release' failed.");
-
-    await this.client.rest.repos.updateRelease({
-      owner: this.owner,
-      repo: this.repo,
-      release_id: release.id,
-      name: "Release Manifest",
-      body: `This release is used to host \`update.json\`, please do not delete or modify it! \n Updated in UTC ${new Date().toISOString()} for version ${this.version}`,
-      make_latest: "false",
-    });
 
     const existAssets = await this.client.rest.repos
       .listReleaseAssets({
@@ -164,17 +181,29 @@ export default class Release extends Base {
 
     if (existAssets) {
       for (const existAsset of existAssets) {
-        await this.client.rest.repos.deleteReleaseAsset({
-          owner: this.owner,
-          repo: this.repo,
-          asset_id: existAsset.id,
-        });
+        if (assets.includes(existAsset.name)) {
+          await this.client.rest.repos.deleteReleaseAsset({
+            owner: this.owner,
+            repo: this.repo,
+            asset_id: existAsset.id,
+          });
+        }
       }
     }
 
     for (const asset of assets) {
-      await this.uploadAsset(release.id, path.join(this.dist, asset));
+      await this.uploadAsset(release.id, join(this.dist, asset));
     }
+
+    await this.client.rest.repos.updateRelease({
+      owner: this.owner,
+      repo: this.repo,
+      release_id: release.id,
+      name: "Release Manifest",
+      body: `This release is used to host \`update.json\`, please do not delete or modify it! \n Updated in UTC ${new Date().toISOString()} for version ${this.version}`,
+      prerelease: true,
+      make_latest: "false",
+    });
   }
 
   getChangelog(): Promise<string> {
@@ -185,8 +214,8 @@ export default class Release extends Base {
           changelog += chunk.toString();
         })
         .on("end", () => {
-          this.logger.debug("changelog:", changelog);
-          resolve(changelog);
+          this.logger.debug("changelog:", changelog.trim());
+          resolve(changelog.trim());
         })
         .on("error", (err) => {
           reject(err);
